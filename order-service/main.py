@@ -1,11 +1,30 @@
+import json
+import os
 from fastapi import FastAPI, HTTPException
+from azure.servicebus import ServiceBusClient, ServiceBusMessage
 from database import get_connection, init_db
+from dotenv import load_dotenv
+
+load_dotenv()
 
 app = FastAPI(title="OrderService", version="1.0.0")
 
 @app.on_event("startup")
 def startup():
     init_db()
+
+def send_return_event(order_id: str, customer_id: str, reason: str):
+    conn_str = os.getenv("SB_SEND")
+    queue = os.getenv("SB_QUEUE")
+    payload = json.dumps({
+        "order_id": order_id,
+        "customer_id": customer_id,
+        "reason": reason
+    })
+    with ServiceBusClient.from_connection_string(conn_str) as client:
+        with client.get_queue_sender(queue) as sender:
+            sender.send_messages(ServiceBusMessage(payload))
+    print(f"[order-service] Sent return event for order {order_id}")
 
 # ---------------------------------------------------------------------------
 # Health
@@ -25,7 +44,7 @@ def get_orders():
     cursor = conn.cursor()
     cursor.execute("""
         SELECT id, customer_id, status, created_at, updated_at
-        FROM orders.[order]
+        FROM DenisIvanets_orders.[order]
         ORDER BY created_at DESC
     """)
     rows = cursor.fetchall()
@@ -48,7 +67,7 @@ def get_order(order_id: str):
     cursor = conn.cursor()
     cursor.execute("""
         SELECT id, customer_id, status, created_at, updated_at
-        FROM orders.[order]
+        FROM DenisIvanets_orders.[order]
         WHERE id = ?
     """, order_id)
     row = cursor.fetchone()
@@ -65,6 +84,53 @@ def get_order(order_id: str):
     }
 
 # ---------------------------------------------------------------------------
+# Cancel order
+# ---------------------------------------------------------------------------
+
+@app.post("/orders/{order_id}/cancel", tags=["orders"])
+def cancel_order(order_id: str, reason: str = "No reason provided"):
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT id, customer_id, status
+        FROM DenisIvanets_orders.[order]
+        WHERE id = ?
+    """, order_id)
+    row = cursor.fetchone()
+
+    if not row:
+        cursor.close()
+        conn.close()
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    if row[2] in ("cancelled", "delivered"):
+        cursor.close()
+        conn.close()
+        raise HTTPException(status_code=400, detail=f"Cannot cancel order with status '{row[2]}'")
+
+    customer_id = str(row[1])
+
+    cursor.execute("""
+        UPDATE DenisIvanets_orders.[order]
+        SET status = 'cancelled', updated_at = SYSDATETIME()
+        WHERE id = ?
+    """, order_id)
+
+    cursor.execute("""
+        INSERT INTO DenisIvanets_orders.order_status_history (order_id, status)
+        VALUES (?, 'cancelled')
+    """, order_id)
+
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+    send_return_event(order_id, customer_id, reason)
+
+    return {"message": "Order cancelled", "order_id": order_id}
+
+# ---------------------------------------------------------------------------
 # Order items
 # ---------------------------------------------------------------------------
 
@@ -74,7 +140,7 @@ def get_order_items(order_id: str):
     cursor = conn.cursor()
     cursor.execute("""
         SELECT id, order_id, product_id, quantity, unit_price
-        FROM orders.order_item
+        FROM DenisIvanets_orders.order_item
         WHERE order_id = ?
     """, order_id)
     rows = cursor.fetchall()
@@ -101,7 +167,7 @@ def get_order_history(order_id: str):
     cursor = conn.cursor()
     cursor.execute("""
         SELECT id, order_id, status, changed_at
-        FROM orders.order_status_history
+        FROM DenisIvanets_orders.order_status_history
         WHERE order_id = ?
         ORDER BY changed_at ASC
     """, order_id)
@@ -117,3 +183,19 @@ def get_order_history(order_id: str):
         }
         for r in rows
     ]
+
+@app.post("/orders/test-create", tags=["orders"])
+def create_test_order():
+    import uuid
+    conn = get_connection()
+    cursor = conn.cursor()
+    new_id = uuid.uuid4()
+    customer_id = uuid.uuid4()
+    cursor.execute(
+        "INSERT INTO DenisIvanets_orders.[order] (id, customer_id, status) VALUES (?,?,?)",
+        new_id, customer_id, "pending"
+    )
+    conn.commit()
+    cursor.close()
+    conn.close()
+    return {"id": str(new_id), "status": "pending"}
